@@ -502,7 +502,7 @@ class FarmAutomationService : Service() {
                 return@acceptCookiesIfPresent
             }
 
-            if (builderInProgress && lower.contains("hero/inventory")) {
+            if (builderInProgress && (lower.contains("/hero") || lower.contains("hero/inventory"))) {
                 handler.postDelayed({ useHeroInventoryForPendingUpgrade() }, 700)
                 return@acceptCookiesIfPresent
             }
@@ -979,7 +979,10 @@ class FarmAutomationService : Service() {
         // mematikan Builder yang memang membutuhkan waktu lebih dari 1 menit.
         handler.removeCallbacks(cycleWatchdogRunnable)
         handler.postDelayed(cycleWatchdogRunnable, 5 * 60_000L)
-        automationWebView()?.loadUrl("$server/dorf1.php")
+        // Mulai village pertama. Fungsi ini mengisi pendingBuilderResourceHref
+        // dari target yang sudah disimpan, lalu membuka dorf1.php agar village
+        // yang dipilih benar-benar diklik sebelum href resource dibuka.
+        processResourceBuilderVillage()
     }
 
     private fun processResourceBuilderVillage() {
@@ -1091,77 +1094,38 @@ class FarmAutomationService : Service() {
     private fun clickBuilderVillageFromDorf() {
         debugTrace("ENTER clickBuilderVillageFromDorf")
         if (!running || !builderInProgress || !builderVillageClickInProgress) return
+
         val village = builderVillages.getOrNull(builderVillageIndex) ?: return
-        val savedVillageHref = builderVillageLinks[village.first].orEmpty().trim()
-        val idJson = JSONObject.quote(village.first)
-        val nameJson = JSONObject.quote(village.second)
-        val hrefJson = JSONObject.quote(savedVillageHref)
-        val js = """
-            (() => {
-                const id = $idJson;
-                const name = $nameJson;
-                const savedHref = $hrefJson;
-                const clean = s => String(s || '').replace(/\s+/g,' ').trim();
-                const sameHref = (a, b) => {
-                    if (!a || !b || b === '#') return false;
-                    const absA = new URL(a, location.href).href.split('#')[0];
-                    const absB = new URL(b, location.href).href.split('#')[0];
-                    return absA === absB;
-                };
-                const anchors = [...document.querySelectorAll('a[href], [data-did]')];
-                let anchor = null;
+        val villageId = village.first
+        val villageName = village.second
+        val savedVillageHref = builderVillageLinks[villageId].orEmpty().trim()
 
-                // Prioritas 1: link village yang memang sudah disimpan saat scan.
-                if (savedHref && savedHref !== '#') {
-                    anchor = anchors.find(a => {
-                        const h = a.getAttribute('href') || '';
-                        return sameHref(h, savedHref);
-                    }) || null;
-                }
+        // PENTING: Resource Builder wajib benar-benar pindah ke village yang dicentang
+        // sebelum membuka target resource. Jangan mengandalkan anchor.click() saja karena
+        // sidebar Travian kadang memakai handler internal/DOM virtual sehingga klik terlihat
+        // berhasil tetapi village aktif tidak berubah.
+        val targetVillageUrl = if (savedVillageHref.isNotBlank() && savedVillageHref != "#") {
+            absoluteBuilderHref(savedVillageHref)
+        } else {
+            "$server/dorf1.php?newdid=$villageId"
+        }
 
-                // Prioritas 2: data-did / newdid dari village yang sama.
-                if (!anchor) {
-                    anchor = anchors.find(a => {
-                        const entry = a.closest('.listEntry, .dropContainer, li');
-                        const dataDid = a.getAttribute('data-did') || entry?.getAttribute('data-did') || '';
-                        const href = a.getAttribute('href') || '';
-                        const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
-                        return dataDid === id || hrefDid === id;
-                    }) || null;
-                }
+        logEvent(
+            "Resource Builder: pindah ke village ${villageName} (ID $villageId) " +
+                "menggunakan link tersimpan: $targetVillageUrl"
+        )
+        builderStage = "WAIT_VILLAGE"
+        builderVillageClickInProgress = true
 
-                if (anchor) {
-                    anchor.scrollIntoView({block:'center', inline:'nearest'});
-                    anchor.click();
-                    return 'clicked';
-                }
-
-                // Last resort: jika Travian tidak merender anchor village tetapi
-                // snapshot memiliki href village yang valid, buka link tersimpan.
-                if (savedHref && savedHref !== '#' && /newdid=\d+/i.test(savedHref)) {
-                    location.href = new URL(savedHref, location.href).href;
-                    return 'loaded_saved_village';
-                }
-                return 'not-found';
-            })();
-        """.trimIndent()
-        automationWebView()?.evaluateJavascript(js) { raw ->
-            val result = raw.orEmpty().trim('"')
-            if (result == "clicked" || result == "loaded_saved_village") {
-                builderStage = "WAIT_VILLAGE"
-                logEvent(
-                    "Resource Builder: ${if (result == "clicked") "klik" else "buka link tersimpan"} " +
-                        "village ${village.second} (ID ${village.first}) dari dorf1.php"
-                )
-            } else if (builderAttempt < 3) {
-                builderAttempt++
-                handler.postDelayed({ clickBuilderVillageFromDorf() }, 350)
-            } else {
-                logEvent("Resource Builder: link village ${village.second} (ID ${village.first}) tidak ditemukan di dorf1.php")
-                builderVillageClickInProgress = false
-                pendingBuilderResourceHref = ""
-                goToNextBuilderVillage()
-            }
+        // Jika sudah berada di village target, jangan reload tanpa perlu; lanjutkan ke
+        // target resource yang tersimpan. Jika belum, navigasi langsung ke newdid target.
+        val currentId = Regex("[?&]newdid=(\\d+)", RegexOption.IGNORE_CASE)
+            .find(automationWebView()?.url.orEmpty())?.groupValues?.getOrNull(1).orEmpty()
+        if (currentId == villageId) {
+            builderStage = "OPEN_RESOURCE"
+            handler.postDelayed({ openSavedBuilderResource() }, 400)
+        } else {
+            automationWebView()?.loadUrl(targetVillageUrl)
         }
     }
 
@@ -1389,13 +1353,13 @@ class FarmAutomationService : Service() {
                 }
                 deficit.isEmpty() || deficit.all { it <= 0L } -> clickResourceUpgrade()
                 costs.size >= 4 && deficit.size >= 4 -> {
-                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L).let { v -> if (v == 0L) 0L else ((v + 99L) / 100L) * 100L } }
+                    pendingUpgradeCosts = LongArray(4) { deficit[it].coerceAtLeast(0L) }
                     pendingUpgradeUrl = webView?.url.orEmpty().ifBlank { "$server/build.php" }
                     val total = pendingUpgradeCosts.sum()
                     logEvent("Resource Builder: resource village kurang; kebutuhan inventory=${pendingUpgradeCosts.joinToString(",")}, total=$total")
                     inventoryUseAttempt = 0
                     updateNotification("Resource Builder — mengambil resource Hero")
-                    automationWebView()?.loadUrl("$server/hero/inventory")
+                    automationWebView()?.loadUrl("$server/hero")
                 }
                 else -> {
                     logEvent("Resource Builder: biaya upgrade tidak terbaca; village dilewati")
@@ -1457,9 +1421,9 @@ class FarmAutomationService : Service() {
                         );
                     });
                     if (!candidate) { missing.push(names[i]); continue; }
-                    const slot = candidate.closest('[data-item-id],[data-slot],.item,.slot,[class*="item"],[class*="slot"]') || candidate.parentElement || candidate;
+                    const slot = candidate.closest('a,button,[role="button"],[data-item-id],[data-slot],.item,.slot,[class*="item"],[class*="slot"]') || candidate.parentElement || candidate;
                     slot.scrollIntoView({block:'center'});
-                    candidate.click();
+                    if (typeof slot.click === 'function') slot.click(); else candidate.click();
                     used = true;
                     break;
                 }
@@ -1476,7 +1440,8 @@ class FarmAutomationService : Service() {
                     goToNextBuilderVillage()
                 }
                 result.contains("item_clicked") -> {
-                    handler.postDelayed({ fillHeroResourceDialog() }, 600)
+                    logEvent("Resource Builder: item resource Hero diklik di /hero; menunggu dialog Transfer resources")
+                    handler.postDelayed({ fillHeroResourceDialog() }, 900)
                 }
                 else -> handler.postDelayed({ useHeroInventoryForPendingUpgrade() }, 700)
             }
@@ -1491,11 +1456,18 @@ class FarmAutomationService : Service() {
             (() => {
                 const needed = [$needed];
                 const names = ['lumber','clay','iron','crop'];
+                const first = selectors => {
+                    for (const selector of selectors) {
+                        const el = document.querySelector(selector);
+                        if (el && !el.disabled) return el;
+                    }
+                    return null;
+                };
                 const inputs = [
-                    document.querySelector('input[name="lumber"]'),
-                    document.querySelector('input[name="clay"]'),
-                    document.querySelector('input[name="iron"]'),
-                    document.querySelector('input[name="crop"]')
+                    first(['input[name="lumber"]','input[name="wood"]','input[name="r1"]','input[id="r1"]','input.r1']),
+                    first(['input[name="clay"]','input[name="r2"]','input[id="r2"]','input.r2']),
+                    first(['input[name="iron"]','input[name="r3"]','input[id="r3"]','input.r3']),
+                    first(['input[name="crop"]','input[name="r4"]','input[id="r4"]','input.r4'])
                 ];
                 const setValue = (el, value) => {
                     if (!el) return false;
