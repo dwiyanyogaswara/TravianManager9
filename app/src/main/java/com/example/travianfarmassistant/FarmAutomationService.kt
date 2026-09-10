@@ -1098,34 +1098,128 @@ class FarmAutomationService : Service() {
         val village = builderVillages.getOrNull(builderVillageIndex) ?: return
         val villageId = village.first
         val villageName = village.second
-        val savedVillageHref = builderVillageLinks[villageId].orEmpty().trim()
+        val idJson = JSONObject.quote(villageId)
+        val nameJson = JSONObject.quote(villageName)
 
-        // PENTING: Resource Builder wajib benar-benar pindah ke village yang dicentang
-        // sebelum membuka target resource. Jangan mengandalkan anchor.click() saja karena
-        // sidebar Travian kadang memakai handler internal/DOM virtual sehingga klik terlihat
-        // berhasil tetapi village aktif tidak berubah.
-        val targetVillageUrl = if (savedVillageHref.isNotBlank() && savedVillageHref != "#") {
-            absoluteBuilderHref(savedVillageHref)
-        } else {
-            "$server/dorf1.php?newdid=$villageId"
-        }
+        // Jangan hanya percaya ID yang tersimpan. Jika mapping lama/scan pernah salah,
+        // cari ulang entry berdasarkan NAMA village yang benar-benar dipilih (mis. C2),
+        // ambil data-did milik entry tersebut, lalu pindah ke ID itu.
+        val js = """
+            (() => {
+                const wantedId = $idJson;
+                const wantedName = $nameJson;
+                const clean = s => String(s || '').replace(/\s+/g,' ').trim();
+                const normalizeName = s => clean(s)
+                    .replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '')
+                    .trim().toLowerCase();
+                const wantedNameNorm = normalizeName(wantedName);
+                const entries = [...document.querySelectorAll(
+                    '#sidebarBoxVillagelist .listEntry, #sidebarBoxVillagelist .dropContainer, .villageList .listEntry, .villageList .dropContainer'
+                )];
 
-        logEvent(
-            "Resource Builder: pindah ke village ${villageName} (ID $villageId) " +
-                "menggunakan link tersimpan: $targetVillageUrl"
-        )
+                let found = null;
+                let foundId = '';
+                let foundHref = '';
+                let match = '';
+
+                // 1. Prioritas: entry dengan ID tersimpan + nama yang sama.
+                for (const entry of entries) {
+                    const anchor = entry.matches('a') ? entry : entry.querySelector('a');
+                    const dataDid = entry.getAttribute('data-did') || anchor?.getAttribute('data-did') || '';
+                    const href = anchor?.getAttribute('href') || '';
+                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                    const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
+                    const name = normalizeName(
+                        entry.querySelector('.name')?.textContent ||
+                        anchor?.getAttribute('title') ||
+                        anchor?.getAttribute('aria-label') || ''
+                    );
+                    if (id === wantedId && name === wantedNameNorm) {
+                        found = entry; foundId = id; foundHref = href; match = 'id+name'; break;
+                    }
+                }
+
+                // 2. Jika ID tersimpan salah, nama menjadi sumber kebenaran.
+                if (!found && wantedNameNorm) {
+                    for (const entry of entries) {
+                        const anchor = entry.matches('a') ? entry : entry.querySelector('a');
+                        const dataDid = entry.getAttribute('data-did') || anchor?.getAttribute('data-did') || '';
+                        const href = anchor?.getAttribute('href') || '';
+                        const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                        const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
+                        const name = normalizeName(
+                            entry.querySelector('.name')?.textContent ||
+                            anchor?.getAttribute('title') ||
+                            anchor?.getAttribute('aria-label') || ''
+                        );
+                        if (/^\d+$/.test(id) && name === wantedNameNorm) {
+                            found = entry; foundId = id; foundHref = href; match = 'name'; break;
+                        }
+                    }
+                }
+
+                // 3. Fallback ID jika nama belum tersedia di DOM.
+                if (!found) {
+                    for (const entry of entries) {
+                        const anchor = entry.matches('a') ? entry : entry.querySelector('a');
+                        const dataDid = entry.getAttribute('data-did') || anchor?.getAttribute('data-did') || '';
+                        const href = anchor?.getAttribute('href') || '';
+                        const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                        const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
+                        if (id === wantedId) {
+                            found = entry; foundId = id; foundHref = href; match = 'id'; break;
+                        }
+                    }
+                }
+
+                if (foundId) {
+                    AndroidFarm.onLiveClickResult(JSON.stringify({
+                        kind:'AUTO_VILLAGE_RESOLVED', wantedId, wantedName,
+                        actualId:foundId, href:foundHref, match, pageUrl:location.href
+                    }));
+                    return JSON.stringify({ok:true, actualId:foundId, href:foundHref, match});
+                }
+
+                AndroidFarm.onLiveClickResult(JSON.stringify({
+                    kind:'AUTO_VILLAGE_RESOLVE_FAILED', wantedId, wantedName,
+                    pageUrl:location.href
+                }));
+                return JSON.stringify({ok:false, actualId:'', href:'', match:''});
+            })();
+        """.trimIndent()
+
         builderStage = "WAIT_VILLAGE"
         builderVillageClickInProgress = true
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val decoded = raw.orEmpty().removePrefix("\"").removeSuffix("\"")
+                .replace("\\\"", "\"").replace("\\\\", "\\")
+            val result = runCatching { JSONObject(decoded) }.getOrNull()
+            val actualId = result?.optString("actualId").orEmpty().trim()
+            val match = result?.optString("match").orEmpty()
 
-        // Jika sudah berada di village target, jangan reload tanpa perlu; lanjutkan ke
-        // target resource yang tersimpan. Jika belum, navigasi langsung ke newdid target.
-        val currentId = Regex("[?&]newdid=(\\d+)", RegexOption.IGNORE_CASE)
-            .find(automationWebView()?.url.orEmpty())?.groupValues?.getOrNull(1).orEmpty()
-        if (currentId == villageId) {
-            builderStage = "OPEN_RESOURCE"
-            handler.postDelayed({ openSavedBuilderResource() }, 400)
-        } else {
-            automationWebView()?.loadUrl(targetVillageUrl)
+            if (actualId.isNotBlank()) {
+                if (actualId != villageId) {
+                    logEvent(
+                        "Resource Builder: mapping village diperbaiki — " +
+                            "$villageName: ID tersimpan=$villageId → ID aktual=$actualId (match=$match)"
+                    )
+                    // Gunakan ID aktual untuk verifikasi halaman berikutnya. Href resource
+                    // tetap memakai target resource yang sudah disimpan untuk village ini.
+                    builderVillages[builderVillageIndex] = actualId to villageName
+                }
+                val targetUrl = "$server/dorf1.php?newdid=$actualId"
+                val currentId = Regex("[?&]newdid=(\d+)", RegexOption.IGNORE_CASE)
+                    .find(automationWebView()?.url.orEmpty())?.groupValues?.getOrNull(1).orEmpty()
+                if (currentId == actualId) {
+                    handler.postDelayed({ openSavedBuilderResource() }, 400)
+                } else {
+                    logEvent("Resource Builder: pindah ke $villageName (ID $actualId)")
+                    automationWebView()?.loadUrl(targetUrl)
+                }
+            } else {
+                logEvent("Resource Builder: village $villageName tidak ditemukan di sidebar; fallback ke ID tersimpan $villageId")
+                automationWebView()?.loadUrl("$server/dorf1.php?newdid=$villageId")
+            }
         }
     }
 
